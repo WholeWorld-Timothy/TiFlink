@@ -1,22 +1,21 @@
 package org.tikv.flink.connectors;
 
-import static org.apache.flink.util.Preconditions.checkNotNull;
-
-import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.HashSet;
+import java.util.HashMap;
+import java.util.Iterator;
 import java.util.List;
+import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
-import java.util.Set;
-import org.apache.flink.annotation.Internal;
-import org.apache.flink.api.common.typeutils.SimpleTypeSerializerSnapshot;
-import org.apache.flink.api.common.typeutils.TypeSerializerSnapshot;
-import org.apache.flink.api.common.typeutils.base.TypeSerializerSingleton;
+import org.apache.flink.api.common.state.CheckpointListener;
+import org.apache.flink.api.common.state.ListState;
+import org.apache.flink.api.common.state.ListStateDescriptor;
 import org.apache.flink.configuration.Configuration;
-import org.apache.flink.core.memory.DataInputView;
-import org.apache.flink.core.memory.DataOutputView;
-import org.apache.flink.streaming.api.functions.sink.TwoPhaseCommitSinkFunction;
+import org.apache.flink.runtime.state.FunctionInitializationContext;
+import org.apache.flink.runtime.state.FunctionSnapshotContext;
+import org.apache.flink.streaming.api.checkpoint.CheckpointedFunction;
+import org.apache.flink.streaming.api.functions.sink.RichSinkFunction;
 import org.apache.flink.table.data.RowData;
 import org.apache.flink.table.data.RowData.FieldGetter;
 import org.apache.flink.table.types.DataType;
@@ -27,20 +26,18 @@ import org.slf4j.LoggerFactory;
 import org.tikv.common.BytePairWrapper;
 import org.tikv.common.ByteWrapper;
 import org.tikv.common.TiConfiguration;
-import org.tikv.common.TiSession;
 import org.tikv.common.codec.TiTableCodec;
-import org.tikv.common.exception.TiBatchWriteException;
 import org.tikv.common.key.RowKey;
 import org.tikv.common.meta.TiColumnInfo;
 import org.tikv.common.meta.TiTableInfo;
 import org.tikv.common.util.ConcreteBackOffer;
 import org.tikv.flink.connectors.coordinators.SnapshotCoordinator;
+import org.tikv.flink.connectors.coordinators.Transaction;
 import org.tikv.txn.TwoPhaseCommitter;
 import shade.com.google.common.base.Preconditions;
 
-public class FlinkTikvProducer
-    extends TwoPhaseCommitSinkFunction<
-        RowData, FlinkTikvProducer.TiKVTransactionState, FlinkTikvProducer.TiKVTransactionContext> {
+public class FlinkTikvProducer extends RichSinkFunction<RowData>
+    implements CheckpointedFunction, CheckpointListener {
 
   private static final long serialVersionUID = 1L;
 
@@ -48,21 +45,21 @@ public class FlinkTikvProducer
 
   private final TiConfiguration conf;
   private final TiTableInfo tableInfo;
-  private final SnapshotCoordinator coordinator;
   private final FieldGetter[] fieldGetters;
   private final int pkIndex;
 
-  private TiSession session = null;
+  private transient SnapshotCoordinator coordinator = null;
+  private transient volatile TransactionHolder currentTransaction = null;
+  private final transient List<BytePairWrapper> cachedValues = new ArrayList<>();
+  private final transient Map<Long, TransactionHolder> transactionMap = new HashMap<>();
+
+  // transactions
+  protected transient ListState<Transaction> transactionState;
 
   public FlinkTikvProducer(
-      final TiConfiguration conf,
-      final TiTableInfo tableInfo,
-      final DataType dataType,
-      final SnapshotCoordinator coordinator) {
-    super(new TransactionStateSerializer(), new ContextStateSerializer());
+      final TiConfiguration conf, final TiTableInfo tableInfo, final DataType dataType) {
     this.conf = conf;
     this.tableInfo = tableInfo;
-    this.coordinator = coordinator;
 
     final List<LogicalType> colTypes = dataType.getLogicalType().getChildren();
     fieldGetters = new FieldGetter[colTypes.size()];
@@ -78,105 +75,80 @@ public class FlinkTikvProducer
     this.pkIndex = tableInfo.getColumns().indexOf(pk.get());
   }
 
-  private TiSession getSession() {
-    if (session == null) {
-      session = TiSession.create(conf);
-    }
-    return session;
-  }
-
-  public static class TiKVTransactionState {
-    private static final int MAX_BUFFER_SIZE = 1 << 20;
-
-    private final transient TwoPhaseCommitter twoPhaseCommitter;
-    private final transient List<BytePairWrapper> buffer;
-    private final transient List<ByteWrapper> secondaryKeys;
-
-    private Long commitTs = null;
-    private byte[] pk = null;
-
-    protected TiKVTransactionState(
-        final TwoPhaseCommitter twoPhaseCommitter, final Long commitTs, final byte[] pk) {
-      this.twoPhaseCommitter = twoPhaseCommitter;
-      this.commitTs = commitTs;
-      this.pk = pk == null ? null : Arrays.copyOf(pk, pk.length);
-      buffer = new ArrayList<>(1 << 15);
-      secondaryKeys = new ArrayList<>(1 << 15);
-    }
-
-    public TiKVTransactionState(final TwoPhaseCommitter twoPhaseCommitter) {
-      this(twoPhaseCommitter, null, null);
-    }
-
-    public void write(final byte[] key, final byte[] value) {
-      if (pk == null) {
-        pk = Arrays.copyOf(key, key.length);
-        twoPhaseCommitter.prewritePrimaryKey(ConcreteBackOffer.newRawKVBackOff(), pk, value);
-      } else {
-        if (buffer.size() >= MAX_BUFFER_SIZE) {
-          twoPhaseCommitter.prewriteSecondaryKeys(pk, buffer.iterator(), 100);
-          buffer.clear();
-        }
-        buffer.add(new BytePairWrapper(key, value));
-        secondaryKeys.add(new ByteWrapper(key));
-      }
-    }
-
-    public void precommit(final long commitTs) {
-      if (pk == null) return;
-
-      if (!buffer.isEmpty()) {
-        twoPhaseCommitter.prewriteSecondaryKeys(pk, buffer.iterator(), 100);
-      }
-
-      twoPhaseCommitter.commitPrimaryKey(ConcreteBackOffer.newRawKVBackOff(), pk, commitTs);
-      this.commitTs = commitTs;
-    }
-
-    public void commit() {
-      if (pk == null) return;
-      twoPhaseCommitter.commitSecondaryKeys(secondaryKeys.iterator(), commitTs, 100);
-    }
-  }
-
-  public static class TiKVTransactionContext {
-    final Set<Long> tsSet;
-
-    public TiKVTransactionContext(Set<Long> tsSet) {
-      checkNotNull(tsSet);
-      this.tsSet = tsSet;
-    }
-
-    @Override
-    public boolean equals(Object o) {
-      if (this == o) {
-        return true;
-      }
-      if (o == null || getClass() != o.getClass()) {
-        return false;
-      }
-      TiKVTransactionContext that = (TiKVTransactionContext) o;
-      return tsSet.equals(that.tsSet);
-    }
-
-    @Override
-    public int hashCode() {
-      return tsSet.hashCode();
-    }
-  }
-
   @Override
   public void open(final Configuration config) throws Exception {
     logger.info("open sink");
-    getSession();
-
     super.open(config);
   }
 
   @Override
-  public void invoke(
-      final TiKVTransactionState transaction, final RowData row, final Context context)
-      throws TiBatchWriteException {
+  public void invoke(final RowData row, final Context context) throws Exception {
+    final BytePairWrapper kv = encodeRow(row);
+
+    if (currentTransaction.getStatus() == Transaction.Status.NEW) {
+      prewritePrimaryKey(kv);
+    }
+
+    cachedValues.add(kv);
+
+    if (cachedValues.size() >= conf.getScanBatchSize()) {
+      prewrite();
+    }
+  }
+
+  public void prewritePrimaryKey(final BytePairWrapper kv) {
+    final byte[] pk = Objects.isNull(kv) ? new byte[0] : kv.getKey();
+
+    final Transaction txn =
+        coordinator.prewriteTransaction(currentTransaction.getCheckpointId(), pk);
+
+    if (Arrays.equals(txn.getPrimaryKey(), pk) && pk.length > 0) {
+      final TwoPhaseCommitter committer = new TwoPhaseCommitter(conf, txn.getStartTs());
+      committer.prewritePrimaryKey(ConcreteBackOffer.newRawKVBackOff(), kv.getKey(), kv.getValue());
+      currentTransaction = new TransactionHolder(txn, committer);
+    } else {
+      currentTransaction = new TransactionHolder(txn);
+    }
+  }
+
+  protected void prewrite() {
+    if (cachedValues.isEmpty()) {
+      return;
+    }
+
+    currentTransaction
+        .getCommitter()
+        .prewriteSecondaryKeys(currentTransaction.getPrimaryKey(), cachedValues.iterator(), 1000);
+    cachedValues.forEach(kv -> currentTransaction.addSecondaryKey(new ByteWrapper(kv.getKey())));
+
+    cachedValues.clear();
+  }
+
+  protected void commit(final Transaction txn, final TwoPhaseCommitter committer) {
+    final byte[] pk = txn.getPrimaryKey();
+    if (Objects.nonNull(pk) && pk.length > 0) {
+      committer.commitPrimaryKey(ConcreteBackOffer.newRawKVBackOff(), pk, txn.getCommitTs());
+    }
+    coordinator.commitTransaction(txn.getCheckpointId());
+  }
+
+  protected void commitSecondaryKeys(
+      final Transaction txn,
+      final TwoPhaseCommitter committer,
+      final Iterator<ByteWrapper> secondaryKeys)
+      throws InterruptedException {
+    while (true) {
+      final Transaction t = coordinator.getTransaction(txn.getCheckpointId());
+      if (t.getStatus() == Transaction.Status.COMMITTED) {
+        committer.commitSecondaryKeys(secondaryKeys, t.getCommitTs(), 1000);
+        return;
+      }
+
+      Thread.sleep(200);
+    }
+  }
+
+  public BytePairWrapper encodeRow(final RowData row) {
     final Object pkValue = fieldGetters[pkIndex].getFieldOrNull(row);
     long handle = 0;
     if (pkValue instanceof Long) {
@@ -186,15 +158,15 @@ public class FlinkTikvProducer
     }
     final RowKey rowKey = RowKey.toRowKey(tableInfo.getId(), handle);
     if (row.getRowKind() == RowKind.DELETE) {
-      transaction.write(rowKey.getBytes(), new byte[0]);
+      return new BytePairWrapper(rowKey.getBytes(), new byte[0]);
     } else {
       try {
-        transaction.write(
+        return new BytePairWrapper(
             rowKey.getBytes(),
             TiTableCodec.encodeRow(
                 tableInfo.getColumns(), TypeUtils.toObjects(row, fieldGetters), true, true));
       } catch (final Throwable t) {
-        logger.error("failed to write value", t);
+        logger.error("failed to encode row", t);
         throw new RuntimeException(t);
       }
     }
@@ -202,206 +174,104 @@ public class FlinkTikvProducer
 
   @Override
   public void close() throws Exception {
-    session.close();
+    coordinator.close();
   }
 
   @Override
-  protected TiKVTransactionState beginTransaction() {
-    logger.info("begin transaction");
-    final long startTs = getSession().getTimestamp().getVersion();
-    final TwoPhaseCommitter twoPhaseCommitter = new TwoPhaseCommitter(conf, startTs);
-    return new TiKVTransactionState(twoPhaseCommitter);
+  public void notifyCheckpointComplete(final long checkpointId) throws Exception {
+    final TransactionHolder txn = transactionMap.remove(checkpointId);
+    if (txn != null) {
+      if (this.getRuntimeContext().getIndexOfThisSubtask() == 0) {
+        commit(txn.getTransaction(), txn.getCommitter());
+      }
+      // TODO: run in background
+      commitSecondaryKeys(txn.getTransaction(), txn.getCommitter(), txn.getSecondaryKeys());
+    }
   }
 
   @Override
-  protected void preCommit(final TiKVTransactionState transaction) {
-    logger.info("precommit");
-    transaction.precommit(session.getTimestamp().getVersion());
+  public void snapshotState(final FunctionSnapshotContext context) throws Exception {
+    prewrite();
+
+    transactionState.clear();
+    transactionState.add(currentTransaction.getTransaction());
+    transactionMap.put(context.getCheckpointId(), currentTransaction);
+
+    currentTransaction =
+        new TransactionHolder(coordinator.openTransaction(context.getCheckpointId()));
   }
 
   @Override
-  protected void commit(final TiKVTransactionState transaction) throws TiBatchWriteException {
-    logger.info("commit");
-    transaction.commit();
+  public void initializeState(final FunctionInitializationContext context) throws Exception {
+    transactionState =
+        context
+            .getOperatorStateStore()
+            .getListState(
+                new ListStateDescriptor<>("transactionState", TransactionSerializer.INSTANCE));
+
+    for (final Transaction txn : transactionState.get()) {
+      // TODO: recover or abort transaction
+    }
+
+    currentTransaction = new TransactionHolder(coordinator.openTransaction(0));
+
+    transactionState.add(currentTransaction.getTransaction());
   }
 
-  @Override
-  protected void abort(TiKVTransactionState transaction) {}
+  static class TransactionHolder implements Transaction {
+    public static final int SECONDARY_KEYS_LIMIT = (1 << 22);
+    private final Transaction transaction;
+    private final TwoPhaseCommitter committer;
+    private final ArrayList<ByteWrapper> secondaryKeys = new ArrayList<>();
 
-  @Internal
-  public static class TransactionStateSerializer
-      extends TypeSerializerSingleton<TiKVTransactionState> {
+    TransactionHolder(final Transaction transaction) {
+      this(transaction, null);
+    }
 
-    private static final long serialVersionUID = 1L;
+    TransactionHolder(final Transaction transaction, final TwoPhaseCommitter committer) {
+      this.transaction = transaction;
+      this.committer = committer;
+    }
 
-    @Override
-    public boolean isImmutableType() {
-      return true;
+    public void addSecondaryKey(final ByteWrapper key) {
+      secondaryKeys.add(key);
+    }
+
+    public Transaction getTransaction() {
+      return transaction;
+    }
+
+    public TwoPhaseCommitter getCommitter() {
+      return committer;
+    }
+
+    public Iterator<ByteWrapper> getSecondaryKeys() {
+      return secondaryKeys.iterator();
     }
 
     @Override
-    public TiKVTransactionState createInstance() {
-      return null;
+    public long getCheckpointId() {
+      return transaction.getCheckpointId();
     }
 
     @Override
-    public TiKVTransactionState copy(TiKVTransactionState from) {
-      return from;
+    public long getStartTs() {
+      return transaction.getStartTs();
     }
 
     @Override
-    public TiKVTransactionState copy(TiKVTransactionState from, TiKVTransactionState reuse) {
-      return from;
+    public long getCommitTs() {
+      return transaction.getCommitTs();
     }
 
     @Override
-    public int getLength() {
-      return -1;
+    public byte[] getPrimaryKey() {
+      return transaction.getPrimaryKey();
     }
 
     @Override
-    public void serialize(TiKVTransactionState record, DataOutputView target) throws IOException {
-      if (record.commitTs == null) {
-        target.writeBoolean(false);
-      } else {
-        target.writeBoolean(true);
-        target.writeLong(record.commitTs);
-      }
-      if (record.pk == null) {
-        target.writeBoolean(false);
-      } else {
-        target.writeBoolean(true);
-        target.write(record.pk);
-      }
-    }
-
-    @Override
-    public TiKVTransactionState deserialize(final DataInputView source) throws IOException {
-      Long ts = null;
-      byte[] key = new byte[1024];
-      if (source.readBoolean()) {
-        ts = source.readLong();
-      }
-      if (source.readBoolean()) {
-        final int len = source.read(key);
-        if (len > 0) {
-          return new TiKVTransactionState(null, ts, Arrays.copyOf(key, len));
-        }
-      }
-
-      return new TiKVTransactionState(null, ts, null);
-    }
-
-    @Override
-    public TiKVTransactionState deserialize(TiKVTransactionState reuse, DataInputView source)
-        throws IOException {
-      return deserialize(source);
-    }
-
-    @Override
-    public void copy(DataInputView source, DataOutputView target) throws IOException {
-      target.writeLong(source.readLong());
-      target.write(source.readUTF().getBytes());
-    }
-
-    // -----------------------------------------------------------------------------------
-
-    @Override
-    public TypeSerializerSnapshot<TiKVTransactionState> snapshotConfiguration() {
-      return new TransactionStateSerializerSnapshot();
-    }
-
-    /** Serializer configuration snapshot for compatibility and format evolution. */
-    @SuppressWarnings("WeakerAccess")
-    public static final class TransactionStateSerializerSnapshot
-        extends SimpleTypeSerializerSnapshot<TiKVTransactionState> {
-
-      public TransactionStateSerializerSnapshot() {
-        super(TransactionStateSerializer::new);
-      }
-    }
-  }
-
-  @Internal
-  public static class ContextStateSerializer
-      extends TypeSerializerSingleton<TiKVTransactionContext> {
-
-    private static final long serialVersionUID = 1L;
-
-    @Override
-    public boolean isImmutableType() {
-      return true;
-    }
-
-    @Override
-    public TiKVTransactionContext createInstance() {
-      return null;
-    }
-
-    @Override
-    public TiKVTransactionContext copy(TiKVTransactionContext from) {
-      return from;
-    }
-
-    @Override
-    public TiKVTransactionContext copy(TiKVTransactionContext from, TiKVTransactionContext reuse) {
-      return from;
-    }
-
-    @Override
-    public int getLength() {
-      return -1;
-    }
-
-    @Override
-    public void serialize(TiKVTransactionContext record, DataOutputView target) throws IOException {
-      int numIds = record.tsSet.size();
-      target.writeInt(numIds);
-      for (Long ts : record.tsSet) {
-        target.writeLong(ts);
-      }
-    }
-
-    @Override
-    public TiKVTransactionContext deserialize(DataInputView source) throws IOException {
-      int numIds = source.readInt();
-      Set<Long> tsSet = new HashSet<>(numIds);
-      for (int i = 0; i < numIds; i++) {
-        tsSet.add(source.readLong());
-      }
-      return new TiKVTransactionContext(tsSet);
-    }
-
-    @Override
-    public TiKVTransactionContext deserialize(TiKVTransactionContext reuse, DataInputView source)
-        throws IOException {
-      return deserialize(source);
-    }
-
-    @Override
-    public void copy(DataInputView source, DataOutputView target) throws IOException {
-      int numIds = source.readInt();
-      target.writeInt(numIds);
-      for (int i = 0; i < numIds; i++) {
-        target.writeLong(source.readLong());
-      }
-    }
-
-    // -----------------------------------------------------------------------------------
-
-    @Override
-    public TypeSerializerSnapshot<TiKVTransactionContext> snapshotConfiguration() {
-      return new ContextStateSerializerSnapshot();
-    }
-
-    /** Serializer configuration snapshot for compatibility and format evolution. */
-    @SuppressWarnings("WeakerAccess")
-    public static final class ContextStateSerializerSnapshot
-        extends SimpleTypeSerializerSnapshot<TiKVTransactionContext> {
-
-      public ContextStateSerializerSnapshot() {
-        super(ContextStateSerializer::new);
-      }
+    public Status getStatus() {
+      return transaction.getStatus();
     }
   }
 }

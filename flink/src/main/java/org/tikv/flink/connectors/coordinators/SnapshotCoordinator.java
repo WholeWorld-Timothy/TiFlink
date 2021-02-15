@@ -1,13 +1,13 @@
 package org.tikv.flink.connectors.coordinators;
 
-public interface SnapshotCoordinator {
-  long getInitTs();
+public interface SnapshotCoordinator extends AutoCloseable {
+  Transaction openTransaction(long checkpointId);
 
-  long getStartTs(long checkpointId);
+  Transaction getTransaction(long checkpointId);
 
-  long getCommitTs(long checkpointId);
+  Transaction prewriteTransaction(long checkpointId, byte[] proposedKey);
 
-  byte[] getPrimaryKey(long checkpointId, byte[] proposedKey);
+  Transaction commitTransaction(long checkpointId);
 
-  boolean isCommitted(long checkpointId);
+  Transaction abortTransaction(long checkpointId);
 }
